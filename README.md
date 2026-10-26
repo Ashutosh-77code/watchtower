@@ -1,102 +1,97 @@
-# WatchTower: Real-Time Log Analyzer & Threat Detector
+# WatchTower
 
-## The Problem
-Servers generate thousands of log lines a day (SSH logins, web requests, errors). If a hacker tries to brute-force a server, it gets buried in the noise. Security analysts need a tool that reads these logs in real time and instantly flags brute-force attacks or suspicious IPs before they cause damage.
+A small Python tool that reads a server's SSH login log and tells you when someone is trying to guess their way in.
 
-## The Solution
-WatchTower is a lightweight, CLI-based cybersecurity tool that monitors SSH authentication logs in real time. It uses regex to parse log lines, Pandas to structure the data, and a sliding-window detector to catch brute-force attempts. When an attacker is flagged, it generates a security incident report automatically.
+![WatchTower catching an attack live](screenshot.png)
 
-## Features
-- **Regex log parsing** of `sshd` lines (failed and accepted logins)
-- **Sliding-window detection**: an IP with `N` failed logins inside `T` seconds is flagged (default 5 in 60 s), so slow, harmless typos are not flagged
-- **Three alert levels**, colour-coded in the terminal: `WARN` (yellow), `BLOCKED` (red), `CRITICAL` (magenta)
-- **Compromise detection**: raises `CRITICAL` if a flagged IP later logs in successfully
-- **Live mode** (`--follow`) that works like `tail -f`
-- **Automatic incident reports** (Markdown) with timeline, targeted usernames, attack rate and recommended actions
-- **Summary table** built with Pandas
-- **Mock log generator** so you can test without a real server
+## Why I built it
 
-## Tech Stack
-- **Python 3.9+**
-- **Pandas** (data structuring and analysis)
-- **Colorama** (terminal text highlighting for alerts)
-- **Regex** (log parsing)
+A busy server writes thousands of login lines a day. If someone starts guessing passwords, those failed attempts sit between all the normal ones, and nobody scrolling through the file by hand is going to notice in time. I wanted to see how a tool could spot that pattern on its own, so I built one from scratch to find out.
 
-## How to Use It
+## What it does
+
+WatchTower reads the log line by line and keeps count of failed logins for every IP address. If one address fails 5 times within 60 seconds, it gets flagged and a red alert appears. If that same address then manages to log in, you get a louder alert, because the attacker may have guessed the password.
+
+Every flagged IP also gets a short incident report written for it, with how fast the attempts came in, which usernames were tried, a timeline, and what to do next. You can see a real one in [`examples/sample_incident_report.md`](examples/sample_incident_report.md).
+
+The alerts come in three colours:
+- **Yellow `WARN`**: an IP has a couple of failed logins, keeping an eye on it
+- **Red `BLOCKED`**: that's an attack, here's the firewall rule you'd use
+- **Magenta `CRITICAL`**: a flagged IP just logged in successfully
+
+## Try it in two minutes
+
+You need Python 3.9 or newer.
+
 ```bash
-# Clone the repo
 git clone https://github.com/yourusername/watchtower.git
 cd watchtower
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Generate a mock log file for testing
-python generate_logs.py
-
-# Run the analyzer
-python analyzer.py --file auth.log
+python generate_logs.py                  # makes a fake auth.log to play with
+python analyzer.py --file auth.log       # reads it and flags the attackers
 ```
 
-### Real-time demo (two terminals)
+The fake log has two attackers (one of them gets in), one slow scanner that should be ignored, and some normal users. So you know what the right answer looks like.
+
+## Play the attacker
+
+This is the fun part. Open two terminals.
+
 ```bash
-# Terminal 1: simulate a server writing log lines live
-python generate_logs.py --live
-```
-```bash
-# Terminal 2 (start it right away): watch the same file as it grows
+# Terminal 1: start watching
 python analyzer.py --file auth.log --follow
 ```
-Alerts appear as the lines arrive. Press `Ctrl+C` to stop and print the summary. In live mode the whole attack is replayed in a few seconds, so even the "slow scanner" can trip the warning.
-
-### Options
-| Option | Default | Meaning |
-|---|---|---|
-| `--file` | required | log file to analyse |
-| `--threshold` | 5 | failed logins that trigger a block |
-| `--window` | 60 | sliding window in seconds |
-| `--follow` | off | keep watching for new lines |
-| `--year` | current year | syslog lines have no year |
-
-## Sample Output
+```bash
+# Terminal 2: be the attacker
+python simulate_attack.py                          # 10 failed logins, so you get blocked
+python simulate_attack.py --attempts 3             # only 3, so nothing happens
+python simulate_attack.py --attempts 8 --success   # gets in, so CRITICAL
 ```
-[17:51:23] [BLOCKED] 198.51.100.23 - brute-force suspected (5 failures in 60s)
-           suggested firewall rule: sudo iptables -A INPUT -s 198.51.100.23 -j DROP
-[18:11:19] [BLOCKED] 198.51.100.99 - brute-force suspected (5 failures in 60s)
-[18:11:43] [CRITICAL] 198.51.100.99 LOGGED IN as 'deploy' after being flagged - possible compromise!
 
-Top sources of failed logins:
-               failed  accepted  users_tried   status
-198.51.100.23      40         0           10  BLOCKED
-198.51.100.99      15         1            1  BLOCKED
-192.0.2.77          3         0            1       ok
-```
-The slow scanner `192.0.2.77` (3 attempts, 10 minutes apart) is correctly **not** flagged.
+Press `Ctrl+C` in the first terminal to stop it and see a summary table.
 
-## How the Detection Works
-1. Each log line is matched with a regex and turned into an event: time, user, IP, result.
-2. For every IP, WatchTower keeps the timestamps of its recent failed logins.
-3. Failures older than the window are dropped; if the remaining count reaches the threshold, the IP is flagged.
-4. A flagged IP that later gets an `Accepted` login triggers a `CRITICAL` alert.
-5. An incident report is written to `reports/incident_<ip>.md`.
+You can also change how strict it is: `--threshold` (how many failures) and `--window` (how many seconds). For example `python analyzer.py --file auth.log --threshold 3 --window 30`.
 
-## Project Structure
+## How it decides
+
+For each IP, it remembers the times of its recent failed logins and forgets anything older than the window. When the number it still remembers reaches the threshold, that IP is flagged. That is why a person who mistypes a password twice isn't treated like an attacker, and why an attacker who is slow and patient (3 tries, 10 minutes apart) stays under the radar. That last part is a real weakness of this approach, and I've left it as it is on purpose.
+
+## Does it actually work?
+
+I tested it two ways.
+
+1. The fake log was built with a known answer. WatchTower flags exactly the two attackers, reports the one who got in, and leaves everyone else alone.
+2. `python test_watchtower.py` runs 7 checks covering the log parser, the 5-in-60-seconds rule, slow attempts being ignored, each IP being counted separately, and the critical alert. I also broke the detector on purpose once to make sure the tests would fail when they should.
+
+Honest caveat: I've only run it on generated logs, not on a real server.
+
+## What it doesn't do
+
+- **It doesn't block anyone.** It prints the `iptables` command you could use, but never runs it. I didn't want a script changing firewall rules on its own.
+- **It only understands OpenSSH-style log lines.** Web server logs would need a new regex.
+- **A slow attacker can slip past it**, as explained above.
+- It's for logs and servers you own or are allowed to monitor.
+
+## What's in the folder
+
 ```
 watchtower/
-├── analyzer.py        # parser, detector, alerts, reports
-├── generate_logs.py   # creates a mock auth.log
+├── analyzer.py          # the detector: parsing, alerts, reports
+├── generate_logs.py     # makes the fake auth.log
+├── simulate_attack.py   # lets you play the attacker
+├── test_watchtower.py   # the 7 checks
+├── examples/            # a sample incident report
 ├── requirements.txt
 └── README.md
 ```
 
-## Notes and Limitations
-- Blocking is **simulated**: WatchTower prints the suggested `iptables` command but never runs it.
-- It reads OpenSSH-style syslog lines only. Other formats need a new regex.
-- All IPs in the mock log are from reserved documentation ranges (RFC 5737).
-- Use it only on logs and servers you own or are authorised to monitor.
+## Built with
 
-## Future Improvements
-- Parse web-server (nginx / Apache) logs
-- Optional automatic blocking and email/Telegram alerts
-- GeoIP lookup for attacker IPs
-- Detect distributed attacks across many IPs
+Python, Pandas for the summary tables, Colorama for the coloured alerts, and a handful of regular expressions to read the log.
+
+## Where I'd take it next
+
+Reading nginx/Apache logs, sending an alert to Telegram or email, looking up where an attacking IP is located, and catching attacks spread across many different IPs.
+
+All the IP addresses in the fake logs come from ranges reserved for documentation, so none of them belong to anyone real.
